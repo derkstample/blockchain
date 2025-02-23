@@ -17,7 +17,7 @@ public class BCNode {
     private Map<Socket,ObjectOutputStream> outputStreams;
     
     final private int N = 5;
-    final private boolean DEBUG = true; // true to print debug info
+    final private boolean DEBUG = false; // true to print debug info
 
     public static void main(String[] args) {
         Scanner keyScan = new Scanner(System.in);
@@ -81,15 +81,16 @@ public class BCNode {
 
     @SuppressWarnings("unchecked") // objectstream type casting warnings were annoying
     public BCNode(int port, List<Integer> peerPorts){
-        if(DEBUG) System.out.println("Creating new BCNode");
+        if(DEBUG) print("Creating new BCNode");
         int numPeers = peerPorts.size();
         peers = new ArrayList<Socket>();
         inputStreams = new HashMap<Socket,ObjectInputStream>();
         outputStreams = new HashMap<Socket,ObjectOutputStream>();
+        List<Thread> threads = new ArrayList<Thread>();
 
         // first, set up ReadHandler threads for each of our given peer nodes (or start the chain if no peers are given)
         if(numPeers > 0){ // if we have at least one peer to get the chain from
-            if(DEBUG) System.out.println("Attempting to start peer connections");
+            if(DEBUG) print("Attempting to start peer connections");
             // in order to prevent bad actors from corrupting the chain by sending invalid blocks to new peers, we need to implement a consensus algorithm that uses majority rule to decide the current state of the chain
             // I chose to do this by just keeping track of what each peer thinks the chain looks like and making a histogram to compare them
             ArrayList<ArrayList<Block>> consensusChains = new ArrayList<ArrayList<Block>>();
@@ -105,39 +106,47 @@ public class BCNode {
                     consensusChains.add((ArrayList<Block>) input.readObject());
                     
                     // now setup a ReadHandler to read any input from the peer in its own thread
-                    ReadHandler rh = new ReadHandler(s,input,this);
+                    ReadHandler rh = new ReadHandler(s,input,this,DEBUG);
                     Thread th = new Thread(rh);
-                    th.start(); // for some reason I thought I just needed to call th.run() and that bug was singlehandidly the most time consuming part of this project because I was too stubborn to read the javadocs for Thread
-                    if(DEBUG) System.out.println("Connected (" + peers.size() + " nodes connected)");
+                    threads.add(th);
+                    if(DEBUG) print("Connected (" + peers.size() + " nodes connected)");
+
                 } catch (Exception e) {
-                    System.out.println(e.getMessage());
-                    System.out.println("Could not connect to node " + peerPorts.get(i) + ", skipping...");
+                    if(DEBUG) print(e.getMessage());
+                    print("Could not connect to node " + peerPorts.get(i) + ", skipping...");
                 }
             }
+
             // lastly determine which chain we read in is actually the correct one using a majority consensus
             chain = determineConsensus(consensusChains);
+
         }else{ // otherwise we must create the whole chain
             Block genesisBlock = new Block();
             chain = new ArrayList<Block>();
             chain.add(genesisBlock);
         }
+
         // now we can start the ConnectionHandler to create a ServerSocket
-        if(DEBUG) System.out.println("Attempting to start ConnectionHandler");
+        if(DEBUG) print("Attempting to start ConnectionHandler");
         try{
-            ConnectionHandler ch = new ConnectionHandler(port, this);
+            ConnectionHandler ch = new ConnectionHandler(port, this, DEBUG);
             Thread th = new Thread(ch);
-            th.start();
+            threads.add(th);
+
         }catch(IOException e){
-            System.out.println("Failed starting ConnectionHandler!");
+            if(DEBUG) e.printStackTrace();
+            print("Failed starting ConnectionHandler, aborting...");
             System.exit(1);
         }
-        if(DEBUG) System.out.println("ConnectionHandler started");
 
+        if(DEBUG) print("ConnectionHandler started");
+        for(Thread th:threads) th.start(); // start the threads at the end of the constructor to mitigate 'leaking' reference to this before construction is complete, as advised at https://docs.oracle.com/javase/tutorial/essential/concurrency/syncmeth.html
     }
 
-    public void addBlock(Block b){
+    public void addBlock(Block b){ // this method cannot be synchronized, else incoming blocks from peers would block and this node would always think it won the mining race
         // step 1: give the block the chain's tailing hash
         b.setPrevHash(chain.getLast().getHash());
+
         // step 2: mining
         String prefixZeros = new String(new char[N]).replace('\0','0');
         String candidateHash = b.calculateBlockHash();
@@ -149,26 +158,30 @@ public class BCNode {
         }
         b.setNonce(nonce);
         b.setHash(candidateHash);
-        // step 4: validate & add the block
+
+        // step 3: validate & add the block
         if(validate(b)){
             chain.add(b); // congrats, you passed!
-            // step 5: send it to all our peers
+
+            // step 4: send it to all our peers
             for(Socket s:peers){
                 try{
                     ObjectOutputStream output = outputStreams.get(s);
                     output.writeObject(b);
                     output.reset();
+
                 }catch(Exception e){
-                    //TODO: clean up
-                    e.printStackTrace();
+                    print("Error sending block to peer at port " + s.getLocalPort());
+                    removePeer(s); // assuming the peer went down
                 }
             }
         }
     }
 
-    public boolean validate(Block candidate){
+    public synchronized boolean validate(Block candidate){ // here, however, we can block the threads to prevent stepping on each others toes 
         // first validate the chain
         String prefixZeros = new String(new char[N]).replace('\0','0');
+
         for(int i=0;i<chain.size();i++){
             Block b = chain.get(i);
             if(!b.calculateBlockHash().equals(b.getHash())) return false;
@@ -181,28 +194,36 @@ public class BCNode {
                         return false;
             }
         }
+
         // then validate the candidate
         if(!candidate.calculateBlockHash().equals(candidate.getHash())
             || !candidate.getPrevHash().equals(chain.getLast().getHash())
             || !candidate.getHash().substring(0,N).equals(prefixZeros)) 
                 return false;
+
         return true;
     }
 
-    public List<Block> getChain(){
+    public synchronized void removePeer(Socket s){ // IMO it would have made more sense to make a Peer object with a Socket, input/output streams, to avoid this. maybe I just implemented this goofy and there's a better way
+        inputStreams.remove(s);
+        outputStreams.remove(s);
+        peers.remove(s);
+    }
+
+    public synchronized List<Block> getChain(){
         return chain;
     }
-    public List<Socket> getPeers(){
+    public synchronized List<Socket> getPeers(){
         return peers;
     }
-    public Map<Socket,ObjectInputStream> getInputStreams(){
+    public synchronized Map<Socket,ObjectInputStream> getInputStreams(){
         return inputStreams;
     }
-    public Map<Socket,ObjectOutputStream> getOutputStreams(){
+    public synchronized Map<Socket,ObjectOutputStream> getOutputStreams(){
         return outputStreams;
     }
 
-
+    // given a list of chains (lists of blocks), return the most common one (the consensus chain)
     private ArrayList<Block> determineConsensus(ArrayList<ArrayList<Block>> candidateChains){
         Map<String,ArrayList<Block>> stringRepresentations = new HashMap<String,ArrayList<Block>>();
         Map<String,Integer> histogram = new HashMap<String,Integer>();
@@ -217,6 +238,7 @@ public class BCNode {
             else
                 histogram.put(chainStr,histogram.get(chainStr)+1); // also count the frequency of each string representation to determine the majority vote
         }
+
         // now find the maximal value for histogram (that is, the most common string representation of the consensus chain)
         Map.Entry<String,Integer> maxEntry = null;
         for(Map.Entry<String,Integer> entry:histogram.entrySet()) // can't believe I haven't used the entryset of a map before
@@ -225,13 +247,14 @@ public class BCNode {
         return stringRepresentations.get(maxEntry.getKey());
     }
 
+    public synchronized void print(String s){ // easy way to add a mutex to the console
+        System.out.println(s);
+    }
 
     @Override
     public String toString() {
         String chainStr = "";
         for(Block b:chain) chainStr += "\t"+b+"\n";
         return "BCNode [chain=\n" + chainStr + "]";
-    }
-
-    
+    }    
 }
